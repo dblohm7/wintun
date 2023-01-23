@@ -5,7 +5,6 @@
 
 #include <Windows.h>
 #include <winternl.h>
-#include <cfgmgr32.h>
 #include <devguid.h>
 #include <iphlpapi.h>
 #include <objbase.h>
@@ -21,12 +20,16 @@
 #if NTDDI_VERSION == NTDDI_WIN7
 #    undef NTDDI_VERSION
 #    define NTDDI_VERSION NTDDI_WIN8
-#    include <devquery.h>
+#    undef WINVER
+#    define WINVER 0x0602
+#    include <cfgmgr32.h>
 #    include <swdevice.h>
 #    undef NTDDI_VERSION
 #    define NTDDI_VERSION NTDDI_WIN7
+#    undef WINVER
+#    define WINVER 0x0601
 #else
-#    include <devquery.h>
+#    include <cfgmgr32.h>
 #    include <swdevice.h>
 #endif
 
@@ -405,6 +408,7 @@ AdapterGetDeviceObjectFileName(LPCWSTR InstanceId)
     return Interfaces;
 }
 
+#if 0
 typedef struct _WAIT_FOR_INTERFACE_CTX
 {
     HANDLE Event;
@@ -506,6 +510,116 @@ cleanup:
     return RET_ERROR(TRUE, LastError);
 }
 
+#endif
+
+static DWORD CALLBACK
+WaitForInterfaceCallback(
+    _In_ HCMNOTIFICATION hNotify,
+    _In_opt_ PVOID Context,
+    _In_ CM_NOTIFY_ACTION Action,
+    _In_reads_bytes_(EventDataSize) PCM_NOTIFY_EVENT_DATA EventData,
+    _In_ DWORD EventDataSize)
+{
+    if (Action == CM_NOTIFY_ACTION_DEVICEINSTANCESTARTED && Context != NULL) {
+      SetEvent(((HANDLE)Context));
+    }
+    return ERROR_SUCCESS;
+}
+
+typedef CONFIGRET (WINAPI *PCM_REGISTER_NOTIFICATION)(PCM_NOTIFY_FILTER,PVOID,PCM_NOTIFY_CALLBACK,PHCMNOTIFICATION);
+typedef CONFIGRET (WINAPI *PCM_UNREGISTER_NOTIFICATION)(HCMNOTIFICATION);
+
+static PCM_REGISTER_NOTIFICATION PCM_Register_Notification;
+static PCM_UNREGISTER_NOTIFICATION PCM_Unregister_Notification;
+
+_Must_inspect_result_
+static _Return_type_success_(return != FALSE)
+BOOL
+WaitForInterface(_In_ WCHAR *InstanceId)
+{
+    if (IsWindows7)
+        return TRUE;
+
+    DWORD LastError = ERROR_SUCCESS;
+
+    HMODULE CfgMgr32 = NULL;
+    if (!PCM_Register_Notification) {
+        CfgMgr32 = GetModuleHandleW(L"cfgmgr32.dll");
+        if (CfgMgr32 == NULL) {
+            goto cleanup;
+        }
+
+        PCM_Register_Notification = (PCM_REGISTER_NOTIFICATION) GetProcAddress(CfgMgr32, "CM_Register_Notification");
+        if (!PCM_Register_Notification) {
+            goto cleanup;
+        }
+    }
+
+    if (!PCM_Unregister_Notification) {
+        if (!CfgMgr32) {
+            CfgMgr32 = GetModuleHandleW(L"cfgmgr32.dll");
+            if (CfgMgr32 == NULL) {
+                goto cleanup;
+            }
+        }
+
+        PCM_Unregister_Notification = (PCM_UNREGISTER_NOTIFICATION) GetProcAddress(CfgMgr32, "CM_Unregister_Notification");
+        if (!PCM_Unregister_Notification) {
+            goto cleanup;
+        }
+    }
+
+    CM_NOTIFY_FILTER Filter = { .cbSize = sizeof(Filter),
+                                .FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINSTANCE };
+    if (wcsncpy_s(Filter.u.DeviceInstance.InstanceId, MAX_DEVICE_ID_LEN, InstanceId, _TRUNCATE))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        goto cleanup;
+    }
+
+    HANDLE Event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!Event)
+    {
+        LastError = LOG_LAST_ERROR(L"Failed to create event");
+        goto cleanup;
+    }
+
+    HCMNOTIFICATION NotificationHandle = NULL;
+    LastError = CM_MapCrToWin32Err(
+        PCM_Register_Notification(
+            &Filter,
+            Event,
+            WaitForInterfaceCallback,
+            &NotificationHandle),
+        ERROR_GEN_FAILURE);
+    if (LastError != ERROR_SUCCESS)
+    {
+        SetLastError(LOG_ERROR(LastError, L"Failed to register for instance arrival notification"));
+        goto cleanupEvent;
+    }
+
+    if (AdapterGetDeviceObjectFileName(InstanceId)) {
+        // Event already triggered, no waiting necessary
+        goto cleanupNotification;
+    }
+
+    LastError = WaitForSingleObject(Event, 15000);
+    if (LastError != WAIT_OBJECT_0)
+    {
+        if (LastError == WAIT_FAILED)
+            LastError = LOG_LAST_ERROR(L"Failed to wait for device query");
+        else
+            LastError = LOG_ERROR(LastError, L"Timed out waiting for device query");
+    }
+
+cleanupNotification:
+    PCM_Unregister_Notification(NotificationHandle);
+cleanupEvent:
+    CloseHandle(Event);
+cleanup:
+    return RET_ERROR(TRUE, LastError);
+}
+
 typedef struct _SW_DEVICE_CREATE_CTX
 {
     HRESULT CreateResult;
@@ -541,6 +655,7 @@ WintunCreateAdapter(LPCWSTR Name, LPCWSTR TunnelType, const GUID *RequestedGUID)
         goto cleanup;
     }
 
+#if 0
     HDEVINFO DevInfoExistingAdapters;
     SP_DEVINFO_DATA_LIST *ExistingAdapters;
     if (!DriverInstall(&DevInfoExistingAdapters, &ExistingAdapters))
@@ -548,6 +663,7 @@ WintunCreateAdapter(LPCWSTR Name, LPCWSTR TunnelType, const GUID *RequestedGUID)
         LastError = GetLastError();
         goto cleanupDeviceInstallationMutex;
     }
+#endif
 
     LOG(WINTUN_LOG_INFO, L"Creating adapter");
 
@@ -805,8 +921,10 @@ cleanupAdapter:
         Adapter = NULL;
     }
 cleanupDriverInstall:
+#if 0
     DriverInstallDeferredCleanup(DevInfoExistingAdapters, ExistingAdapters);
 cleanupDeviceInstallationMutex:
+#endif
     NamespaceReleaseMutex(DeviceInstallationMutex);
 cleanup:
     QueueUpOrphanedDeviceCleanupRoutine();
